@@ -22,7 +22,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import https from 'node:https';
 import { classifyCategory } from './category.js';
-import { reviewNews, pruneAiCache, summarizeGithubRepo, summarizeGithubTaglines } from './ai.js';
+import { reviewNews, pruneAiCache, summarizeGithubRepo, summarizeGithubTaglines, pickGithubProjects } from './ai.js';
 import { getSettings, saveSettings, publicSettings, testDeepSeekKey } from './settings.js';
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
@@ -377,13 +377,18 @@ async function fetchBaiduHot() {
 /* ---------------- GitHub 热门项目 ---------------- */
 
 const GITHUB_TRENDING_DAYS = 30; // "近期" = 近 30 天创建的新项目
-const GITHUB_PER_CATEGORY = 5;   // 每个用途分类取前 5 个
+const GITHUB_PER_CATEGORY = 10;  // 每个分类拉取上限 (数量不设死, 由热门度 + AI 筛选决定最终展示)
 
-/**
- * 用途分类: 覆盖不同方面/层次的项目
+/** 质量筛选阈值 */
+const HOT_STAR_THRESHOLD = 800;        // star ≥ 800: 足够热门, 直接保留
+const AI_CANDIDATE_MIN_STARS = 100;    // 100 ≤ star < 800: 交给 AI 判断是否值得推荐
+const NO_AI_FALLBACK_STARS = 400;      // 无 AI key 时: star ≥ 400 保留 (降级)
+const CATEGORY_FLOOR = 3;              // 每类保底展示数 (该类 star 最高者, 保证分类覆盖)
+const GITHUB_MAX_TOTAL = 60;           // 展示总量上限 (防刷屏)
+
+/** 用途分类: 覆盖不同方面/层次的项目
  * 注意: GitHub search API 不支持 OR 组合限定符 (会 422), 每类固定一个主 topic;
- *       未认证限流 10 次/分钟, 8 类串行拉取稳在限流内。
- */
+ *       未认证限流 10 次/分钟, 8 类串行拉取稳在限流内。 */
 const GITHUB_CATEGORIES = [
   { name: 'AI 大模型', query: 'topic:ai' },
   { name: '开发者工具', query: 'topic:developer-tools' },
@@ -426,13 +431,14 @@ function mapGithubRepo(r, category) {
 }
 
 /**
- * 按用途分类拉取近 30 天热门新项目 (每类取 star 前 5), 合并去重后全局按 star 排序
+ * 按用途分类拉取近 30 天热门新项目 (每类拉取上限 10), 合并去重后
+ * 按"热门度 + AI 质量筛选"决定最终展示 (数量不设死), 全局按 star 排序。
  * 注意: 项目不是新闻, 不走新闻过滤/时效管线, 独立缓存与接口。
  */
 async function fetchGithubTrending() {
   const created = `created:>${isoDaysAgo(GITHUB_TRENDING_DAYS)}`;
   const headers = { 'User-Agent': 'NewsApp/1.0 (github trending)', 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' };
-  // 串行拉取: 未认证 search API 限流 10 次/分钟, 8 个分类串行单次刷新约 4 秒, 稳在限流内
+  // 串行拉取: 未认证 search API 限流 10 次/分钟, 8 个分类串行单次刷新约 4-8 秒, 稳在限流内
   const results = [];
   for (const cat of GITHUB_CATEGORIES) {
     const q = encodeURIComponent(`${cat.query} ${created}`);
@@ -441,8 +447,10 @@ async function fetchGithubTrending() {
       const j = await httpGetJson(url, { headers });
       results.push((j.items || []).map((r) => mapGithubRepo(r, cat.name)));
     } catch (e) {
-      console.warn(`[upstream] github-分类「${cat.name}」:`, e.message);
-      results.push([]);
+      // 失败 (403 限流/网络): 若旧缓存有该类项目则沿用, 保证分类不空
+      const old = (githubCache.data?.items || []).filter((it) => it.category === cat.name);
+      console.warn(`[upstream] github-分类「${cat.name}」: ${e.message}${old.length ? `, 沿用旧数据 ${old.length} 个` : ''}`);
+      results.push(old);
     }
   }
 
@@ -453,10 +461,109 @@ async function fetchGithubTrending() {
       if (!byId.has(it.id) || it.stars > byId.get(it.id).stars) byId.set(it.id, it);
     }
   }
-  const items = [...byId.values()]
+  const merged = [...byId.values()].sort((a, b) => b.stars - a.stars);
+
+  // 质量筛选: 热门直留 + AI 挑选, 数量不设死
+  const items = (await filterGithubByQuality(merged))
     .sort((a, b) => b.stars - a.stars)
+    .slice(0, GITHUB_MAX_TOTAL)
     .map((it, i) => ({ ...it, rank: i + 1 }));
   return { items, total: items.length, categories: GITHUB_CATEGORIES.map((c) => c.name) };
+}
+
+/* ---------------- GitHub 质量筛选 (热门直留 + AI 挑选) ---------------- */
+
+const PICKS_FILE = path.join(__dirname, 'data', 'github-picks.json');
+const PICKS_TTL_MS = 7 * 86400 * 1000;       // AI 判定 7 天内不重复询问
+const PICKS_MIN_INTERVAL_MS = 60 * 60 * 1000; // AI 筛选频率闸: 至少间隔 1 小时
+const PICKS_TIMEOUT_MS = 25000;               // AI 筛选超时则降级 (不阻塞列表)
+
+let picksCache = null; // Map<fullName, {picked, reason, at}>
+let lastPicksCallAt = 0;
+
+function loadPicksCache() {
+  if (picksCache) return;
+  picksCache = new Map();
+  try {
+    if (fs.existsSync(PICKS_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(PICKS_FILE, 'utf8'));
+      for (const [k, v] of Object.entries(raw)) picksCache.set(k, { picked: !!v.picked, reason: v.reason || '', at: Number(v.at) || 0 });
+    }
+  } catch (e) {
+    console.warn('[picks] 缓存加载失败:', e.message);
+  }
+}
+
+function savePicksCache() {
+  try {
+    fs.mkdirSync(path.dirname(PICKS_FILE), { recursive: true });
+    const obj = {};
+    const keepBefore = Date.now() - PICKS_TTL_MS;
+    picksCache.forEach((v, k) => { if (v.at >= keepBefore) obj[k] = { picked: v.picked, reason: v.reason, at: v.at }; });
+    const tmp = PICKS_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(obj), 'utf8');
+    fs.renameSync(tmp, PICKS_FILE);
+  } catch (e) {
+    console.warn('[picks] 缓存保存失败:', e.message);
+  }
+}
+
+/**
+ * 质量筛选:
+ * 1) star ≥ HOT_STAR_THRESHOLD → 热门, 直接保留
+ * 2) AI_CANDIDATE_MIN_STARS ≤ star < HOT_STAR_THRESHOLD → 批量交给 AI 判断 (带缓存/频率闸/超时)
+ * 3) 每类保底 CATEGORY_FLOOR 个 (该类 star 最高者), 保证分类覆盖
+ * 4) 无 AI key 或 AI 不可用 → 降级: star ≥ NO_AI_FALLBACK_STARS 保留
+ */
+async function filterGithubByQuality(items) {
+  const hot = items.filter((it) => it.stars >= HOT_STAR_THRESHOLD);
+  const candidates = items.filter((it) => it.stars >= AI_CANDIDATE_MIN_STARS && it.stars < HOT_STAR_THRESHOLD);
+
+  // 每类保底: 该类 star 最高的 CATEGORY_FLOOR 个 (不设 star 门槛)
+  const floorNames = new Set();
+  for (const cat of GITHUB_CATEGORIES) {
+    items
+      .filter((it) => it.category === cat.name)
+      .sort((a, b) => b.stars - a.stars)
+      .slice(0, CATEGORY_FLOOR)
+      .forEach((it) => floorNames.add(it.fullName));
+  }
+
+  loadPicksCache();
+  const now = Date.now();
+  const need = candidates.filter((it) => {
+    const v = picksCache.get(it.fullName);
+    return !v || now - v.at > PICKS_TTL_MS;
+  });
+
+  if (need.length > 0 && now - lastPicksCallAt >= PICKS_MIN_INTERVAL_MS) {
+    lastPicksCallAt = now;
+    const map = await Promise.race([
+      pickGithubProjects(need),
+      new Promise((res) => setTimeout(() => res(null), PICKS_TIMEOUT_MS)),
+    ]);
+    if (map && map.size > 0) {
+      const at = Date.now();
+      for (const [k, v] of map) picksCache.set(k, { ...v, at });
+      savePicksCache();
+      console.log(`[picks] AI 筛选 ${map.size} 个项目: 推荐 ${[...map.values()].filter((v) => v.picked).length} 个`);
+    } else {
+      console.log('[picks] AI 筛选未执行 (无 key 或失败), 使用降级阈值');
+    }
+  }
+
+  const aiPicked = candidates.filter((it) => {
+    const v = picksCache.get(it.fullName);
+    if (v && now - v.at <= PICKS_TTL_MS) return v.picked;      // 有 AI 判定: 按判定
+    return it.stars >= NO_AI_FALLBACK_STARS;                    // 未判定 (降级): 放宽阈值
+  });
+
+  // 合并去重: 热门 + AI 挑选 + 分类保底
+  const merged = new Map();
+  for (const it of [...hot, ...aiPicked, ...items.filter((it) => floorNames.has(it.fullName))]) {
+    if (!merged.has(it.id) || it.stars > merged.get(it.id).stars) merged.set(it.id, it);
+  }
+  return [...merged.values()];
 }
 
 /** 拉取 + 概括 + 预热 全流程 (无缓存判断, 调用方决定何时执行) */
@@ -528,7 +635,9 @@ function saveTaglineCache() {
   }
 }
 
-/** 为没有缓存概括的项目批量生成 (一次 API 调用), 带频率闸与超时兜底 */
+/**
+ * 为没有缓存概括的项目分批生成 (每批 ≤ 30, 防止一次输出截断), 带频率闸与超时兜底
+ */
 async function enrichTaglines(items) {
   loadTaglineCache();
   const now = Date.now();
@@ -538,15 +647,23 @@ async function enrichTaglines(items) {
   });
   if (need.length > 0 && now - lastTaglineCallAt >= TAGLINE_MIN_INTERVAL_MS) {
     lastTaglineCallAt = now;
-    const map = await Promise.race([
-      summarizeGithubTaglines(need),
-      new Promise((res) => setTimeout(() => res(null), TAGLINE_TIMEOUT_MS)),
-    ]);
-    if (map && map.size > 0) {
-      const at = Date.now();
-      for (const [k, text] of map) taglineCache.set(k, { text, at });
+    const BATCH = 30;
+    let generated = 0;
+    for (let i = 0; i < need.length; i += BATCH) {
+      const batch = need.slice(i, i + BATCH);
+      const map = await Promise.race([
+        summarizeGithubTaglines(batch),
+        new Promise((res) => setTimeout(() => res(null), TAGLINE_TIMEOUT_MS)),
+      ]);
+      if (map && map.size > 0) {
+        const at = Date.now();
+        for (const [k, text] of map) taglineCache.set(k, { text, at });
+        generated += map.size;
+      }
+    }
+    if (generated > 0) {
       saveTaglineCache();
-      console.log(`[tagline] 批量生成 ${map.size} 条项目概括`);
+      console.log(`[tagline] 分批生成 ${generated} 条项目概括 (${Math.ceil(need.length / BATCH)} 批)`);
     } else {
       console.log('[tagline] 本轮未生成 (无 AI key 或生成失败), 列表回退英文简介');
     }

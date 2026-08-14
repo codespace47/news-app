@@ -356,3 +356,68 @@ export async function summarizeGithubTaglines(repos) {
   }
   return result;
 }
+
+/* ---------------- GitHub 项目质量筛选 (批量) ---------------- */
+
+const GITHUB_PICK_PROMPT = `你是开源项目推荐编辑。下面是一批近 30 天创建的 GitHub 项目, 其中部分项目 Star 数不高。
+
+请判断每个项目是否"值得推荐给开发者浏览"。值得推荐的标准(满足其一即可):
+1. 创新性: 解决新问题或用新方式解决老问题
+2. 实用性: 能直接用在真实开发/工作/生活中, 工程质量迹象明显
+3. 话题性: 在某个领域有代表性, 值得关注
+
+不值得推荐: 纯套壳、玩具 demo、明显营销/引流项目、内容空洞、和现有知名项目比没有差异化的重复轮子。
+
+要求:
+- 对每个项目都必须给出 recommend (true/false)
+- 拿不准时倾向 recommend=false (宁缺毋滥)
+- reason 用不超过 12 字的中文说明理由
+
+输出严格 JSON (不要输出其他内容):
+{"items":[{"fullName":"owner/repo","recommend":true,"reason":"理由"}]}`;
+
+/**
+ * AI 批量判断一批 GitHub 项目是否值得推荐
+ * @param {Array<{fullName:string, desc?:string, language?:string, stars?:number}>} repos
+ * @returns {Promise<Map<string,{picked:boolean, reason:string}>|null>}
+ */
+export async function pickGithubProjects(repos) {
+  const settings = getSettings();
+  if (!settings.deepseekApiKey) return null;
+  if (repos.length === 0) return new Map();
+  const userContent = JSON.stringify(repos.map((r) => ({
+    fullName: r.fullName,
+    desc: (r.desc || '').slice(0, 120),
+    language: r.language || '',
+    stars: r.stars || 0,
+  })));
+  const { status, text } = await httpsPost(apiUrl(), {
+    model: settings.model || 'deepseek-chat',
+    messages: [
+      { role: 'system', content: GITHUB_PICK_PROMPT },
+      { role: 'user', content: userContent },
+    ],
+    response_format: { type: 'json_object' },
+    temperature: 0.2,
+    max_tokens: 4096,
+  }, settings.deepseekApiKey, 60000);
+
+  if (status !== 200) {
+    console.warn(`[ai] GitHub 筛选 HTTP ${status}:`, text.slice(0, 200));
+    return null;
+  }
+  const parsed = parseAiJson(JSON.parse(text).choices?.[0]?.message?.content || '');
+  const list = parsed.items;
+  if (!Array.isArray(list)) return null;
+  const want = new Set(repos.map((r) => r.fullName));
+  const result = new Map();
+  for (const entry of list) {
+    const name = String(entry?.fullName || '');
+    if (!want.has(name)) continue;
+    result.set(name, {
+      picked: entry?.recommend === true,
+      reason: String(entry?.reason || '').slice(0, 20),
+    });
+  }
+  return result;
+}
