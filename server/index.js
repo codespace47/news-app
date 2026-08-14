@@ -400,6 +400,7 @@ const GITHUB_CACHE_TTL_MS = 30 * 60 * 1000; // GitHub search API 限流 10 次/�
 let githubInflight = null;
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+const logImmediate = (...args) => process.stderr.write('[warm] ' + args.join(' ') + '\n');
 
 function isoDaysAgo(days) {
   const d = new Date(Date.now() - days * 86400 * 1000);
@@ -458,21 +459,36 @@ async function fetchGithubTrending() {
   return { items, total: items.length, categories: GITHUB_CATEGORIES.map((c) => c.name) };
 }
 
+/** 拉取 + 概括 + 预热 全流程 (无缓存判断, 调用方决定何时执行) */
+async function refreshGithubAndWarm() {
+  const data = await fetchGithubTrending();
+  const items = await enrichTaglines(data.items); // 补中文一句话概括 (有 AI key 时)
+  githubCache.data = { ...data, items, fetchedAt: new Date().toISOString() };
+  githubCache.at = Date.now();
+  loadSummaryCache();
+  warmGithubSummaries(items); // 后台预热详细总结, 不阻塞
+  return githubCache.data;
+}
+
 async function getGithubTrending() {
   const now = Date.now();
   if (githubCache.data && now - githubCache.at < GITHUB_CACHE_TTL_MS) return githubCache.data;
   if (githubInflight) return githubInflight;
-  githubInflight = (async () => {
-    const data = await fetchGithubTrending();
-    const items = await enrichTaglines(data.items); // 补中文一句话概括 (有 AI key 时)
-    githubCache.data = { ...data, items, fetchedAt: new Date().toISOString() };
-    githubCache.at = Date.now();
-    // 后台预热详细总结: 不阻塞响应 (见下方预热逻辑)
-    loadSummaryCache();
-    warmGithubSummaries(items);
-    return githubCache.data;
-  })().finally(() => { githubInflight = null; });
+  githubInflight = refreshGithubAndWarm().finally(() => { githubInflight = null; });
   return githubInflight;
+}
+
+/* ---------------- GitHub 主动刷新循环 ---------------- */
+// 不依赖用户请求: 服务启动后 30 秒首次拉榜+预热, 之后每 30 分钟主动刷新一次,
+// 保证"新项目列入排行榜的那一刻"就在后台生成总结与概括。
+function startGithubRefreshLoop() {
+  const run = () => {
+    if (githubInflight) return; // 已有请求进行中, 跳过本轮
+    refreshGithubAndWarm().catch((e) => logImmediate('主动刷新失败:', e.message));
+  };
+  setTimeout(run, 30 * 1000); // 启动后 30 秒首次执行
+  setInterval(run, GITHUB_CACHE_TTL_MS).unref?.(); // 之后每 30 分钟
+  logImmediate('主动刷新循环已启动: 启动后 30s 首跑, 之后每 30 分钟');
 }
 
 /* ---------------- GitHub 项目一句话概括 (批量生成 + 持久化缓存) ---------------- */
@@ -624,45 +640,47 @@ async function getGithubSummary(fullName) {
 const WARM_IMMEDIATE = 5;   // 前 5 名优先预热
 const WARM_CONCURRENCY = 3; // 并发生成数 (DeepSeek 单次请求约 2-5s, 3 并发约 20-40s 完成全部)
 let warmRunning = false;
+let warmQueued = false;    // 预热进行中再次触发 → 完成后重跑一次 (不丢新进榜项目)
 
 async function warmGithubSummaries(items) {
-  if (warmRunning) return; // 已有预热进行中, 跳过 (下次刷新会补)
+  if (warmRunning) { warmQueued = true; return; } // 运行中: 标记, 完成后补跑
   warmRunning = true;
   try {
-    const now = Date.now();
-    const pending = items
-      .filter((it) => {
-        const v = summaryCache.get(it.fullName);
-        return !v || now - v.at > SUMMARY_TTL_MS;
-      })
-      .sort((a, b) => a.rank - b.rank); // 按排行榜名次, 前面的先总结
-    if (pending.length === 0) return;
-    console.log(`[warm] 后台预热 ${pending.length} 个项目总结: 前 ${Math.min(WARM_IMMEDIATE, pending.length)} 个优先, 并发 ${WARM_CONCURRENCY}`);
-
-    // 并发池: 前 WARM_IMMEDIATE 个立即按序启动, 其余由池子自动接管
-    let next = 0;
-    const done = new Set();
-    const worker = async () => {
-      while (next < pending.length) {
-        const it = pending[next++];
-        const t0 = Date.now();
-        try {
-          const text = await generateSummaryFor(it.fullName);
-          console.log(`[warm] #${it.rank} ${it.fullName} ${text ? `已生成 (${Date.now() - t0}ms)` : '生成失败, 跳过'}`);
-        } catch (e) {
-          console.warn(`[warm] #${it.rank} ${it.fullName} 异常: ${e.message}, 继续下一个`);
-        }
-        done.add(it.rank);
+    do {
+      warmQueued = false;
+      const now = Date.now();
+      const pending = items
+        .filter((it) => {
+          const v = summaryCache.get(it.fullName);
+          return !v || now - v.at > SUMMARY_TTL_MS;
+        })
+        .sort((a, b) => a.rank - b.rank); // 按排行榜名次, 前面的先总结
+      if (pending.length === 0) {
+        console.log('[warm] 无待预热项目 (全部已有缓存)');
+        break;
       }
-    };
-    // 前 5 个: 每个 worker 立即启动一个, 保证优先顺序
-    const bootCount = Math.min(WARM_IMMEDIATE, pending.length);
-    await Promise.all(Array.from({ length: Math.min(WARM_CONCURRENCY, bootCount) }, () => worker()));
-    // 兜底: 若并发数大于 bootCount (极端情况) 补足
-    if (WARM_CONCURRENCY > bootCount) {
-      await Promise.all(Array.from({ length: WARM_CONCURRENCY - bootCount }, () => worker()));
-    }
-    console.log(`[warm] 预热完成: ${done.size}/${pending.length} 个项目已处理`);
+      logImmediate(` 后台预热 ${pending.length} 个项目总结: 前 ${Math.min(WARM_IMMEDIATE, pending.length)} 个优先, 并发 ${WARM_CONCURRENCY}`);
+
+      // 并发池: 前 WARM_IMMEDIATE 个立即按序启动, 其余由池子自动接管
+      let next = 0;
+      const worker = async () => {
+        while (next < pending.length) {
+          const it = pending[next++];
+          const t0 = Date.now();
+          try {
+            const text = await generateSummaryFor(it.fullName);
+            logImmediate(` #${it.rank} ${it.fullName} ${text ? `已生成 (${Date.now() - t0}ms)` : '生成失败, 跳过'}`);
+          } catch (e) {
+            console.warn(`[warm] #${it.rank} ${it.fullName} 异常: ${e.message}, 继续下一个`);
+          }
+        }
+      };
+      const bootCount = Math.min(WARM_IMMEDIATE, pending.length);
+      const workers = Array.from({ length: Math.min(WARM_CONCURRENCY, bootCount) }, () => worker());
+      if (WARM_CONCURRENCY > bootCount) workers.push(...Array.from({ length: WARM_CONCURRENCY - bootCount }, () => worker()));
+      await Promise.all(workers);
+      logImmediate(` 本轮预热完成: ${pending.length} 个项目已处理`);
+    } while (warmQueued); // 期间有新触发 → 立即补跑
   } catch (e) {
     console.warn('[warm] 预热中断:', e.message);
   } finally {
@@ -944,4 +962,5 @@ app.get('*', (req, res, next) => {
 app.listen(PORT, () => {
   console.log(`[news] 服务已启动: http://localhost:${PORT} (板块版 v3)`);
   setInterval(pruneAiCache, 10 * 60 * 1000).unref?.(); // 定期清理 AI 审查缓存
+  startGithubRefreshLoop(); // 主动刷新 GitHub 榜单 + 后台预热 (不依赖用户请求)
 });
