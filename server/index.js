@@ -513,7 +513,7 @@ async function fetchGithubTrending() {
     .sort((a, b) => b.stars - a.stars)
     .slice(0, GITHUB_MAX_TOTAL)
     .map((it, i) => ({ ...it, rank: i + 1 }));
-  return { items, total: items.length, categories: [...GITHUB_CATEGORIES.map((c) => c.name), '综合热门'] };
+  return { items, total: items.length, categories: ['综合热门', ...GITHUB_CATEGORIES.map((c) => c.name)] };
 }
 
 /* ---------------- GitHub 质量筛选 (热门直留 + AI 挑选) ---------------- */
