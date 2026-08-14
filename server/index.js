@@ -404,6 +404,37 @@ const githubCache = { data: null, at: 0 };
 const GITHUB_CACHE_TTL_MS = 30 * 60 * 1000; // GitHub search API 限流 10 次/分钟, 缓存 30 分钟
 let githubInflight = null;
 
+/* ---------------- 榜单磁盘持久化 (限流/重启兜底) ---------------- */
+// 每次刷新成功后写入磁盘; 启动时加载, 使"重启 + 限流 403"时也能用上次完整榜单兜底。
+const TRENDING_FILE = path.join(__dirname, 'data', 'github-trending.json');
+
+function loadTrendingFromDisk() {
+  try {
+    if (fs.existsSync(TRENDING_FILE)) {
+      const raw = JSON.parse(fs.readFileSync(TRENDING_FILE, 'utf8'));
+      githubCache.data = raw;
+      githubCache.at = 0; // 强制视为过期: 首次请求仍会触发刷新 (拿到最新数据后覆盖)
+      console.log(`[github] 已加载磁盘榜单: ${raw.items?.length || 0} 个项目 (兜底)`);
+      return raw;
+    }
+  } catch (e) {
+    console.warn('[github] 磁盘榜单加载失败:', e.message);
+  }
+  return null;
+}
+
+function saveTrendingToDisk() {
+  try {
+    if (!githubCache.data) return;
+    fs.mkdirSync(path.dirname(TRENDING_FILE), { recursive: true });
+    const tmp = TRENDING_FILE + '.tmp';
+    fs.writeFileSync(tmp, JSON.stringify(githubCache.data), 'utf8');
+    fs.renameSync(tmp, TRENDING_FILE);
+  } catch (e) {
+    console.warn('[github] 磁盘榜单保存失败:', e.message);
+  }
+}
+
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const logImmediate = (...args) => process.stderr.write('[warm] ' + args.join(' ') + '\n');
 
@@ -438,7 +469,7 @@ function mapGithubRepo(r, category) {
 async function fetchGithubTrending() {
   const created = `created:>${isoDaysAgo(GITHUB_TRENDING_DAYS)}`;
   const headers = { 'User-Agent': 'NewsApp/1.0 (github trending)', 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' };
-  // 串行拉取: 未认证 search API 限流 10 次/分钟, 8 个分类串行单次刷新约 4-8 秒, 稳在限流内
+  // 串行拉取: 未认证 search API 限流 10 次/分钟, 9 个请求串行单次刷新约 5-9 秒, 稳在限流内
   const results = [];
   for (const cat of GITHUB_CATEGORIES) {
     const q = encodeURIComponent(`${cat.query} ${created}`);
@@ -454,7 +485,21 @@ async function fetchGithubTrending() {
     }
   }
 
-  // 跨分类合并去重 (同一项目可能命中多个 topic), 保留 star 高者
+  // 综合热门: 无 topic 限制的全局查询 (近 30 天 star 前 N)。
+  // 关键防漏: 大量爆火项目 (如 deepseek-harness) 不打 ai/llm 等常规标签,
+  // 分类搜索会漏掉它们, 全局通道保证"最火的永远在榜"。
+  const hotUrl = `https://api.github.com/search/repositories?q=${encodeURIComponent(created)}&sort=stars&order=desc&per_page=${GITHUB_PER_CATEGORY}`;
+  try {
+    const j = await httpGetJson(hotUrl, { headers });
+    results.push((j.items || []).map((r) => mapGithubRepo(r, '综合热门')));
+  } catch (e) {
+    const old = (githubCache.data?.items || []).filter((it) => it.category === '综合热门');
+    console.warn(`[upstream] github-综合热门: ${e.message}${old.length ? `, 沿用旧数据 ${old.length} 个` : ''}`);
+    results.push(old);
+  }
+
+  // 跨分类合并去重 (同一项目可能命中多个 topic 或综合热门), 保留 star 高者;
+  // 分类结果先于综合热门 push, 同 star 时不替换 → 命中真实分类的项目优先归入该分类
   const byId = new Map();
   for (const list of results) {
     for (const it of list) {
@@ -468,7 +513,7 @@ async function fetchGithubTrending() {
     .sort((a, b) => b.stars - a.stars)
     .slice(0, GITHUB_MAX_TOTAL)
     .map((it, i) => ({ ...it, rank: i + 1 }));
-  return { items, total: items.length, categories: GITHUB_CATEGORIES.map((c) => c.name) };
+  return { items, total: items.length, categories: [...GITHUB_CATEGORIES.map((c) => c.name), '综合热门'] };
 }
 
 /* ---------------- GitHub 质量筛选 (热门直留 + AI 挑选) ---------------- */
@@ -572,6 +617,7 @@ async function refreshGithubAndWarm() {
   const items = await enrichTaglines(data.items); // 补中文一句话概括 (有 AI key 时)
   githubCache.data = { ...data, items, fetchedAt: new Date().toISOString() };
   githubCache.at = Date.now();
+  saveTrendingToDisk(); // 持久化兜底
   loadSummaryCache();
   warmGithubSummaries(items); // 后台预热详细总结, 不阻塞
   return githubCache.data;
@@ -1079,5 +1125,6 @@ app.get('*', (req, res, next) => {
 app.listen(PORT, () => {
   console.log(`[news] 服务已启动: http://localhost:${PORT} (板块版 v3)`);
   setInterval(pruneAiCache, 10 * 60 * 1000).unref?.(); // 定期清理 AI 审查缓存
+  loadTrendingFromDisk(); // 加载上次榜单兜底 (重启 + 限流时仍有数据)
   startGithubRefreshLoop(); // 主动刷新 GitHub 榜单 + 后台预热 (不依赖用户请求)
 });
