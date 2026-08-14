@@ -258,17 +258,30 @@ function GhCard({ item }) {
   );
 }
 
-function GithubPage({ items, updatedAt }) {
+function GithubPage({ items, categories, updatedAt }) {
+  // 按后端分类顺序分组; 无分类字段的项目归入「其他」
+  const groups = (categories.length > 0 ? categories : ['其他'])
+    .map((cat) => ({ cat, list: items.filter((it) => it.category === cat) }))
+    .concat(categories.length > 0 ? [{ cat: '其他', list: items.filter((it) => !it.category) }] : [])
+    .filter((g) => g.list.length > 0);
   return (
     <section className="home-section">
       <div className="section-head">
         <h2 className="section-title">GitHub 热门</h2>
-        {updatedAt && <span className="section-count">近 30 天新项目 · 按 Star 排序</span>}
+        {updatedAt && <span className="section-count">近 30 天新项目 · 分类展示 · 共 {items.length} 个</span>}
       </div>
-      {items.length > 0 ? (
-        <div className="gh-list">
-          {items.map((it) => <GhCard key={it.id} item={it} />)}
-        </div>
+      {groups.length > 0 ? (
+        groups.map((g) => (
+          <div className="gh-group" key={g.cat}>
+            <div className="gh-group-head">
+              <h3 className="gh-group-title">{g.cat}</h3>
+              <span className="section-count">{g.list.length} 个项目</span>
+            </div>
+            <div className="gh-list">
+              {g.list.map((it) => <GhCard key={it.id} item={it} />)}
+            </div>
+          </div>
+        ))
       ) : (
         <div className="empty">GitHub 热门暂不可用, 请稍后刷新</div>
       )}
@@ -557,6 +570,7 @@ export default function App() {
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [newVersion, setNewVersion] = useState(false);
   const [ghItems, setGhItems] = useState([]);
+  const [ghCategories, setGhCategories] = useState([]);
   const [ghUpdatedAt, setGhUpdatedAt] = useState(null);
   const [ghLoading, setGhLoading] = useState(false);
   const [ghError, setGhError] = useState(null);
@@ -576,6 +590,7 @@ export default function App() {
       const j = await r.json();
       if (!j.items?.length) throw new Error('GitHub 热门暂无数据');
       setGhItems(j.items);
+      if (Array.isArray(j.categories)) setGhCategories(j.categories);
       setGhUpdatedAt(Date.now());
       setGhError(null);
     } catch (e) {
@@ -699,7 +714,7 @@ export default function App() {
                 <button onClick={() => loadGithub()}>重试</button>
               </div>
             )}
-            {ghLoading && ghItems.length === 0 ? <Skeleton /> : <GithubPage items={ghItems} updatedAt={ghUpdatedAt} />}
+            {ghLoading && ghItems.length === 0 ? <Skeleton /> : <GithubPage items={ghItems} categories={ghCategories} updatedAt={ghUpdatedAt} />}
           </>
         ) : loading && items.length === 0 ? (
           <Skeleton />

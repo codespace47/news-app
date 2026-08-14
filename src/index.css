@@ -963,3 +963,32 @@ body {
   overflow: hidden;
   word-break: break-word;
 }
+
+/* ---------- GitHub 分类分组 ---------- */
+.gh-group { margin-bottom: 26px; }
+
+.gh-group-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 10px;
+  margin-bottom: 10px;
+}
+
+.gh-group-title {
+  font-size: 16px;
+  font-weight: 750;
+  color: var(--text);
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.gh-group-title::before {
+  content: '';
+  width: 4px;
+  height: 15px;
+  border-radius: 2px;
+  background: var(--accent);
+  flex-shrink: 0;
+}

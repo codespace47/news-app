@@ -377,29 +377,37 @@ async function fetchBaiduHot() {
 /* ---------------- GitHub 热门项目 ---------------- */
 
 const GITHUB_TRENDING_DAYS = 30; // "近期" = 近 30 天创建的新项目
-const GITHUB_PER_PAGE = 20;      // 20 个左右
+const GITHUB_PER_CATEGORY = 5;   // 每个用途分类取前 5 个
+
+/**
+ * 用途分类: 覆盖不同方面/层次的项目
+ * 注意: GitHub search API 不支持 OR 组合限定符 (会 422), 每类固定一个主 topic;
+ *       未认证限流 10 次/分钟, 8 类串行拉取稳在限流内。
+ */
+const GITHUB_CATEGORIES = [
+  { name: 'AI 大模型', query: 'topic:ai' },
+  { name: '开发者工具', query: 'topic:developer-tools' },
+  { name: 'Web 前端', query: 'topic:frontend' },
+  { name: '数据与基础设施', query: 'topic:database' },
+  { name: '安全与隐私', query: 'topic:security' },
+  { name: '效率与自动化', query: 'topic:productivity' },
+  { name: '游戏与多媒体', query: 'topic:game' },
+  { name: '移动端', query: 'topic:mobile' },
+];
 
 const githubCache = { data: null, at: 0 };
 const GITHUB_CACHE_TTL_MS = 30 * 60 * 1000; // GitHub search API 限流 10 次/分钟, 缓存 30 分钟
 let githubInflight = null;
+
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 function isoDaysAgo(days) {
   const d = new Date(Date.now() - days * 86400 * 1000);
   return d.toISOString().slice(0, 10);
 }
 
-/**
- * 近 30 天创建、star 数最多的 20 个项目 (GitHub 官方 search API, 免费无需 key)
- * 注意: 项目不是新闻, 不走新闻过滤/时效管线, 独立缓存与接口。
- */
-async function fetchGithubTrending() {
-  const q = encodeURIComponent(`created:>${isoDaysAgo(GITHUB_TRENDING_DAYS)}`);
-  const url = `https://api.github.com/search/repositories?q=${q}&sort=stars&order=desc&per_page=${GITHUB_PER_PAGE}`;
-  const j = await httpGetJson(url, {
-    headers: { 'User-Agent': 'NewsApp/1.0 (github trending)', 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' },
-  });
-  const items = (j.items || []).map((r, i) => ({
-    rank: i + 1,
+function mapGithubRepo(r, category) {
+  return {
     id: r.id,
     name: r.name,
     fullName: r.full_name,
@@ -412,8 +420,42 @@ async function fetchGithubTrending() {
     owner: r.owner?.login || '',
     createdAt: r.created_at || '',
     pushedAt: r.pushed_at || '',
-  }));
-  return { items, total: items.length };
+    category, // 用途分类
+  };
+}
+
+/**
+ * 按用途分类拉取近 30 天热门新项目 (每类取 star 前 5), 合并去重后全局按 star 排序
+ * 注意: 项目不是新闻, 不走新闻过滤/时效管线, 独立缓存与接口。
+ */
+async function fetchGithubTrending() {
+  const created = `created:>${isoDaysAgo(GITHUB_TRENDING_DAYS)}`;
+  const headers = { 'User-Agent': 'NewsApp/1.0 (github trending)', 'Accept': 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28' };
+  // 串行拉取: 未认证 search API 限流 10 次/分钟, 8 个分类串行单次刷新约 4 秒, 稳在限流内
+  const results = [];
+  for (const cat of GITHUB_CATEGORIES) {
+    const q = encodeURIComponent(`${cat.query} ${created}`);
+    const url = `https://api.github.com/search/repositories?q=${q}&sort=stars&order=desc&per_page=${GITHUB_PER_CATEGORY}`;
+    try {
+      const j = await httpGetJson(url, { headers });
+      results.push((j.items || []).map((r) => mapGithubRepo(r, cat.name)));
+    } catch (e) {
+      console.warn(`[upstream] github-分类「${cat.name}」:`, e.message);
+      results.push([]);
+    }
+  }
+
+  // 跨分类合并去重 (同一项目可能命中多个 topic), 保留 star 高者
+  const byId = new Map();
+  for (const list of results) {
+    for (const it of list) {
+      if (!byId.has(it.id) || it.stars > byId.get(it.id).stars) byId.set(it.id, it);
+    }
+  }
+  const items = [...byId.values()]
+    .sort((a, b) => b.stars - a.stars)
+    .map((it, i) => ({ ...it, rank: i + 1 }));
+  return { items, total: items.length, categories: GITHUB_CATEGORIES.map((c) => c.name) };
 }
 
 async function getGithubTrending() {
@@ -425,6 +467,9 @@ async function getGithubTrending() {
     const items = await enrichTaglines(data.items); // 补中文一句话概括 (有 AI key 时)
     githubCache.data = { ...data, items, fetchedAt: new Date().toISOString() };
     githubCache.at = Date.now();
+    // 后台预热详细总结: 不阻塞响应 (见下方预热逻辑)
+    loadSummaryCache();
+    warmGithubSummaries(items);
     return githubCache.data;
   })().finally(() => { githubInflight = null; });
   return githubInflight;
@@ -532,6 +577,18 @@ function saveSummaryCache() {
   }
 }
 
+/** 生成并缓存单个项目的 AI 总结 (调用方负责确认项目存在) */
+async function generateSummaryFor(fullName) {
+  const repo = (githubCache.data?.items || []).find((it) => it.fullName === fullName);
+  if (!repo) return null;
+  const text = await summarizeGithubRepo(repo);
+  if (text) {
+    summaryCache.set(fullName, { text, at: Date.now() });
+    saveSummaryCache();
+  }
+  return text;
+}
+
 /**
  * 获取项目 AI 总结: 优先内存/文件缓存, 未命中才调用 AI (同项目并发去重)
  * 项目不在热门列表中时不生成总结, 避免 AI 凭空编造
@@ -552,15 +609,65 @@ async function getGithubSummary(fullName) {
       repo = (githubCache.data?.items || []).find((it) => it.fullName === fullName);
     }
     if (!repo) return { summary: null, cached: false, notFound: true }; // 不在热门列表, 不生成
-    const text = await summarizeGithubRepo(repo);
-    if (text) {
-      summaryCache.set(fullName, { text, at: Date.now() });
-      saveSummaryCache();
-    }
+    const text = await generateSummaryFor(fullName);
     return { summary: text, cached: false };
   })().finally(() => summaryInflight.delete(fullName));
   summaryInflight.set(fullName, p);
   return p;
+}
+
+/* ---------------- GitHub 总结后台预热 ---------------- */
+// 排行榜刷新后立即在后台按排名顺序生成详细总结:
+// 前 WARM_IMMEDIATE 名优先 (用户最常先浏览), 其余并发池依次补全。
+// 纯后台执行, 不阻塞列表响应; 7 天缓存保证不重复消耗; 单项目失败不中断整体。
+
+const WARM_IMMEDIATE = 5;   // 前 5 名优先预热
+const WARM_CONCURRENCY = 3; // 并发生成数 (DeepSeek 单次请求约 2-5s, 3 并发约 20-40s 完成全部)
+let warmRunning = false;
+
+async function warmGithubSummaries(items) {
+  if (warmRunning) return; // 已有预热进行中, 跳过 (下次刷新会补)
+  warmRunning = true;
+  try {
+    const now = Date.now();
+    const pending = items
+      .filter((it) => {
+        const v = summaryCache.get(it.fullName);
+        return !v || now - v.at > SUMMARY_TTL_MS;
+      })
+      .sort((a, b) => a.rank - b.rank); // 按排行榜名次, 前面的先总结
+    if (pending.length === 0) return;
+    console.log(`[warm] 后台预热 ${pending.length} 个项目总结: 前 ${Math.min(WARM_IMMEDIATE, pending.length)} 个优先, 并发 ${WARM_CONCURRENCY}`);
+
+    // 并发池: 前 WARM_IMMEDIATE 个立即按序启动, 其余由池子自动接管
+    let next = 0;
+    const done = new Set();
+    const worker = async () => {
+      while (next < pending.length) {
+        const it = pending[next++];
+        const t0 = Date.now();
+        try {
+          const text = await generateSummaryFor(it.fullName);
+          console.log(`[warm] #${it.rank} ${it.fullName} ${text ? `已生成 (${Date.now() - t0}ms)` : '生成失败, 跳过'}`);
+        } catch (e) {
+          console.warn(`[warm] #${it.rank} ${it.fullName} 异常: ${e.message}, 继续下一个`);
+        }
+        done.add(it.rank);
+      }
+    };
+    // 前 5 个: 每个 worker 立即启动一个, 保证优先顺序
+    const bootCount = Math.min(WARM_IMMEDIATE, pending.length);
+    await Promise.all(Array.from({ length: Math.min(WARM_CONCURRENCY, bootCount) }, () => worker()));
+    // 兜底: 若并发数大于 bootCount (极端情况) 补足
+    if (WARM_CONCURRENCY > bootCount) {
+      await Promise.all(Array.from({ length: WARM_CONCURRENCY - bootCount }, () => worker()));
+    }
+    console.log(`[warm] 预热完成: ${done.size}/${pending.length} 个项目已处理`);
+  } catch (e) {
+    console.warn('[warm] 预热中断:', e.message);
+  } finally {
+    warmRunning = false;
+  }
 }
 
 /* ---------------- 标题时效追踪 ---------------- */
